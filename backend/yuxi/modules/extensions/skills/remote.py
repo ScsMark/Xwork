@@ -3,16 +3,22 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import shutil
 import tempfile
+import uuid
 from dataclasses import dataclass
+from itertools import batched
 from pathlib import Path
 from urllib.parse import urlparse
 
-from yuxi.infrastructure.observability.logging import logger
 from yuxi.infrastructure.filesystem import await_io
+from yuxi.modules.agents.runtime.sandbox import UserSandboxBackend
+from yuxi.modules.agents.runtime.sandbox.container import SandboxRunnerClient
+from yuxi.modules.agents.runtime.sandbox.download import download_sandbox_directory
 from yuxi.modules.extensions.options import remote_skill_source_policy
 from yuxi.modules.extensions.skills.package import is_valid_skill_slug
+from yuxi.modules.workspace.runtime_paths import WORKSPACE_PATH
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 CONTROL_SEQUENCE_RE = re.compile(r"\x1B\][^\x07]*(?:\x07|\x1B\\)|\x1B[\(\)][A-Za-z0-9]")
@@ -20,6 +26,13 @@ CLI_TIMEOUT_SECONDS = 300
 GITHUB_REPO_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\.{1,2}$)[A-Za-z0-9_.-]+$")
 GITHUB_HOST = "github.com"
 INVALID_SOURCE_MESSAGE = "source 仅支持远程 Skill 来源白名单中的 HTTPS 地址"
+
+
+def _output_tail(output: object, *, lines: int = 6, limit: int = 600) -> str:
+    """取 CLI 输出的末几行，用于把真实失败原因透传给界面。"""
+    text = ANSI_ESCAPE_RE.sub("", str(output or ""))
+    tail = " ".join(text.strip().splitlines()[-lines:]).strip()
+    return tail[-limit:] or "无输出"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,30 +109,17 @@ async def download_remote_skills(
     try:
         try:
             temp_home = tempfile.mkdtemp(prefix=".remote-skills-")
-            skill_args: list[str] = []
-            for _index, name in requests:
-                skill_args.extend(["--skill", name])
-
             cli_failed = False
             cli_error = ""
-            try:
-                await sandbox.run(
-                    [
-                        "npx",
-                        "-y",
-                        "skills",
-                        "add",
-                        normalized_source,
-                        *skill_args,
-                        "-g",
-                        "-y",
-                        "--copy",
-                    ]
-                )
-            except ValueError as exc:
-                # CLI 对不匹配的 skill 会退出码非零，但已安装的目录仍在；保留真实原因。
-                cli_failed = True
-                cli_error = str(exc)
+            # 每个 runner 请求最多接受 205 个参数，固定参数占用 8 个位置。
+            for batch in batched(requests, 98):
+                skill_args = [argument for _index, name in batch for argument in ("--skill", name)]
+                try:
+                    await sandbox.run(["npx", "-y", "skills", "add", normalized_source, *skill_args, "-g", "-y", "--copy"])
+                except ValueError as exc:
+                    # 某个包未匹配时 CLI 会失败，其他已经获取的目录仍可使用。
+                    cli_failed = True
+                    cli_error = str(exc)
 
             downloaded_dirs: dict[str, Path | None] = {}
             for original_index, name in requests:
@@ -166,72 +166,73 @@ async def search_remote_skills(query: str, *, uid: str) -> list[dict[str, str]]:
 
 @dataclass(slots=True)
 class _RemoteSkillRequest:
-    """在业务进程内执行远程 Skill CLI，临时 HOME 按请求隔离。
+    """在操作者环境执行远程 Skill CLI，临时文件按请求隔离。"""
 
-    CLI 必须在有外网与 Node 的进程里运行；沙箱执行环境按 Run 创建，
-    设置页发起的安装请求没有 Run 上下文，因此这里改用宿主进程执行。
-    """
-
-    home: Path
+    home: str
+    backend: UserSandboxBackend
+    runner: SandboxRunnerClient | None = None
 
     @classmethod
     def create(cls, uid: str) -> _RemoteSkillRequest:
-        """每个请求只创建自己的宿主临时 HOME，执行结束后整体删除。"""
-        del uid  # 目录与用户隔离，CLI 不需要用户身份
-        home = Path(tempfile.mkdtemp(prefix=".remote-skills-"))
-        (home / "workspace").mkdir(parents=True, exist_ok=True)
-        return cls(home=home)
+        """为操作者创建独占目录，并使用部署所选的获取执行器。"""
+        from yuxi.modules.workspace.filesystem import Workspace
+        from yuxi.modules.workspace.paths import ensure_user_workspace
+
+        backend = UserSandboxBackend(uid=uid)
+        request_id = f"remote-skill-{uuid.uuid4().hex}"
+        home = f"{WORKSPACE_PATH}/.remote-skills/{request_id}"
+        ensure_user_workspace(uid)
+        workspace = Workspace(uid)
+        try:
+            workspace.create_authorized_directory("/", ".remote-skills", root="/")
+        except FileExistsError:
+            pass
+        workspace.create_authorized_directory("/.remote-skills", request_id, root="/")
+        workspace.create_authorized_directory(f"/.remote-skills/{request_id}", "workspace", root="/")
+        runner = SandboxRunnerClient() if os.environ.get("SANDBOX_BACKEND", "container").strip().lower() == "container" else None
+        return cls(home=home, backend=backend, runner=runner)
 
     async def run(self, args: list[str]) -> str:
-        """执行 Skills CLI，并返回合并后的标准输出与标准错误。"""
-        env = {
-            "HOME": str(self.home),
-            "TMPDIR": str(self.home / "tmp"),
-            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            "LANG": "C.UTF-8",
-            "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-            "NPM_CONFIG_FUND": "false",
-        }
-        (self.home / "tmp").mkdir(parents=True, exist_ok=True)
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=str(self.home / "workspace"),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
+        """执行 Skills CLI，并返回原始命令输出。"""
+        if self.runner is not None:
+            # HTTP 请求没有 Agent Run；专用获取容器只挂载本请求目录，不借用聊天环境。
+            result = await await_io(
+                asyncio.to_thread(self.runner.fetch_skills, uid=self.backend.id, request_id=Path(self.home).name, args=args)
+            )
+            if result.get("exit_code") != 0 or result.get("truncated") is not False or not isinstance(result.get("output"), str):
+                raise ValueError(f"skills CLI 执行失败：{_output_tail(result.get('output'))}")
+            return result["output"]
+
+        workspace = f"{self.home}/workspace"
+        command = " && ".join(
+            [
+                f"mkdir -p {shlex.quote(workspace)}",
+                f"cd {shlex.quote(workspace)}",
+                f"HOME={shlex.quote(self.home)} {shlex.join(args)}",
+            ]
         )
-        try:
-            output_bytes, _ = await asyncio.wait_for(process.communicate(), timeout=CLI_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise ValueError(f"skills CLI 执行超时（{CLI_TIMEOUT_SECONDS} 秒）") from exc
-        output = ANSI_ESCAPE_RE.sub("", output_bytes.decode("utf-8", errors="replace"))
-        if process.returncode != 0:
-            tail = " ".join(output.strip().splitlines()[-6:])[-600:]
-            logger.error("skills CLI exit={} args={} output={}", process.returncode, args[:4], tail)
-            raise ValueError(f"skills CLI 执行失败（退出码 {process.returncode}）：{tail or '无输出'}")
+        result = await self.backend.aexecute(command, timeout=CLI_TIMEOUT_SECONDS)
+        output = str(result.output or "")
+        if result.exit_code != 0:
+            raise ValueError(f"skills CLI 执行失败：{_output_tail(output)}")
         return output
 
     async def download_skill(self, name: str, target_dir: Path) -> None:
-        """将本次 CLI 生成的技能目录复制到宿主临时目录。"""
-        source_dir = self.home / ".agents" / "skills" / name
-        if not source_dir.is_dir():
-            raise ValueError("skills CLI 未生成预期的技能目录")
-        await await_io(asyncio.to_thread(self._copy_dir, source_dir, target_dir))
-
-    @staticmethod
-    def _copy_dir(source_dir: Path, target_dir: Path) -> None:
-        """覆盖式复制技能目录，保留文件内容与权限。"""
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_dir, target_dir, symlinks=False)
+        """将 Sandbox 内的一个 Skill 下载到宿主临时目录。"""
+        remote_dir = f"{self.home}/.agents/skills/{name}"
+        await await_io(
+            asyncio.to_thread(
+                download_sandbox_directory,
+                self.backend,
+                remote_dir,
+                target_dir,
+                empty_message="skills CLI 未生成预期的技能目录",
+            )
+        )
 
     async def cleanup(self) -> None:
-        """只移除本请求的临时目录。"""
-        await await_io(asyncio.to_thread(shutil.rmtree, self.home, ignore_errors=True))
+        """只移除本请求的临时文件，不暂停或销毁用户环境。"""
+        await await_io(asyncio.to_thread(self.backend.delete_authorized_path, self.home, root=WORKSPACE_PATH))
 
 
 def _normalize_source(source: str, allowed_hosts: list[str]) -> str:
