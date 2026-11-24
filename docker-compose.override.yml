@@ -1,0 +1,10 @@
+services:
+  api:
+    command: >
+      uv run --no-sync --no-dev
+      uvicorn yuxi.api.main:app --reload --reload-delay 1
+      --no-access-log --host 0.0.0.0 --port 5050 --timeout-graceful-shutdown 5
+  worker:
+    command: >
+      uv run --no-sync --no-dev
+      arq yuxi.workers.main.WorkerSettings --watch

@@ -1,0 +1,34 @@
+# 服务器生产形态：后台服务器专跑 Docker（prod compose）。
+#
+# 用法（服务器上）：
+#   docker compose --profile container \
+#     -f docker-compose.prod.yml -f deploy/server-app-prod.override.yml up -d
+#
+# 与 server-app.override.yml（开发形态）的差异：
+# 1. prod compose 的 api 已绑 127.0.0.1:6050（仅本机可达），这里改为
+#    0.0.0.0:5050 以便任意机器上的前端访问；
+# 2. prod compose 的 frontend 容器内是 nginx（80），开发形态是 vite dev（5173），
+#    故此处用 80；
+# 3. prod compose 不挂载源码，改代码需重新 build 镜像。
+#
+# compose 的 ports 为追加语义，prod 的 api 会同时保留 127.0.0.1:6050 与
+# 0.0.0.0:5050 两条；两者监听不同宿主端口，均可用，不影响运行。
+# 若只需单一入口，把基础 compose 里 api 的 ports 改为 ${YUXI_API_PORT:-6050} 即可。
+
+services:
+  api:
+    ports: !override
+      - "0.0.0.0:5050:5050"
+    environment:
+      # 前端部署在任意机器时，逐个加入其来源；多个来源用逗号分隔。
+      YUXI_CORS_ORIGINS: ${YUXI_CORS_ORIGINS:-http://localhost:5273,http://localhost:8080}
+      # 对象存储公开地址：跨机部署时前端需直接访问，故给出后端对外地址。
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-/minio}
+
+  worker:
+    environment:
+      YUXI_CORS_ORIGINS: ${YUXI_CORS_ORIGINS:-http://localhost:5273,http://localhost:8080}
+
+  frontend:
+    ports: !override
+      - "0.0.0.0:${YUXI_FRONTEND_PORT:-5273}:80"

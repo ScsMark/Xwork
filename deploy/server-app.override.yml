@@ -1,0 +1,49 @@
+# 服务器部署形态：后台服务器专跑 Docker，前端产物部署到任意机器。
+#
+# 与 server-infra.override.yml 的区别：
+#   server-infra.override.yml → 只跑数据层容器，api/worker 在开发者本机运行
+#   本文件（server-app.override.yml）→ api/worker/frontend 全部在服务器上运行，
+#                                  前端产物可另行部署到任意机器（改 runtime-config.js 即可）
+#
+# 用法（服务器上，开发形态：vite dev 前端 + 源码热重载）：
+#   docker compose --profile container \
+#     -f docker-compose.yml -f deploy/server-app.override.yml up -d
+#
+# 生产形态请用 deploy/server-app-prod.override.yml：
+#   docker compose --profile container \
+#     -f docker-compose.prod.yml -f deploy/server-app-prod.override.yml up -d
+#
+# 关键点：
+# 1. api 暴露到 0.0.0.0:5050，供任意机器上的前端访问；
+# 2. YUXI_CORS_ORIGINS 必须包含前端所在机器的来源，否则浏览器跨域拦截；
+# 3. 前端产物部署到其他机器时，把 frontend/public/runtime-config.js 里的
+#    __YUXI_API_BASE__ 改为 api 的对外地址（如 http://10.249.7.130:5050），
+#    并把该来源加入 YUXI_CORS_ORIGINS。
+#
+# 注意 compose 的 ports 为**纯追加**语义：override 声明的端口不会替换基础 compose 的条目，
+# 同一容器端口会出现两条（基础 compose 的 127.0.0.1 与本文件的 0.0.0.0 各一条），
+# 后者绑定时必然报 "address already in use"。故用 !override 整段替换（需 Compose ≥ v2.24）。
+#
+# 本文件对应开发 compose（其 api 未声明 ports、frontend 容器内为 5173）；
+# 生产 compose 的端口差异见 server-app-prod.override.yml。
+
+services:
+  api:
+    ports: !override
+      - "0.0.0.0:5050:5050"
+    environment:
+      # 前端部署在任意机器时，逐个加入其来源；多个来源用逗号分隔。
+      YUXI_CORS_ORIGINS: ${YUXI_CORS_ORIGINS:-http://localhost:5273,http://localhost:8080}
+      # 对象存储公开地址：跨机部署时前端需直接访问，故给出后端对外地址。
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-/minio}
+
+  worker:
+    environment:
+      YUXI_CORS_ORIGINS: ${YUXI_CORS_ORIGINS:-http://localhost:5273,http://localhost:8080}
+
+  frontend:
+    ports: !override
+      - "0.0.0.0:${YUXI_FRONTEND_PORT:-5273}:5173"
+    environment:
+      # 前端 dev server 在容器内反代 api；跨机时由 runtime-config.js 指定后端地址。
+      VITE_API_URL: ${VITE_API_URL:-http://api:5050}

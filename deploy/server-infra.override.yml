@@ -1,0 +1,54 @@
+# 服务器基建模式：仅运行数据层容器（PG/Redis/Milvus/Neo4j/MinIO/MinerU/沙箱执行器），
+# 应用容器（api/worker/frontend）在开发者本机运行。
+#
+# 用法：
+#   docker compose --profile container -f docker-compose.yml -f deploy/server-infra.override.yml up -d
+#
+# 端口说明（重要）：
+#   基础 compose 里这些服务绑 127.0.0.1，只允许服务器本机访问；
+#   本文件把基建端口放开到 0.0.0.0，供本机应用通过 10.249.7.130:端口 直连。
+#
+#   compose 合并 ports 是**纯追加**语义：override 写的端口不会替换基础 compose 的条目，
+#   同一容器端口会出现两条（127.0.0.1 与 0.0.0.0 各一条），后者绑定时必然报
+#   "address already in use"。故此处用 !override 标签整段替换（需 Compose ≥ v2.24）。
+#
+# 切换形态前请先停掉旧形态的容器，否则旧容器仍占用宿主端口，新容器绑定失败：
+#   docker compose --profile container -f docker-compose.yml -f deploy/server-app.override.yml down
+
+services:
+  api:
+    deploy:
+      replicas: 0
+  worker:
+    deploy:
+      replicas: 0
+  frontend:
+    deploy:
+      replicas: 0
+  app-init:
+    deploy:
+      replicas: 0
+  postgres:
+    ports: !override
+      - "0.0.0.0:${YUXI_POSTGRES_PORT:-5432}:5432"
+  redis:
+    ports: !override
+      - "0.0.0.0:${YUXI_REDIS_PORT:-6379}:6379"
+  milvus:
+    ports: !override
+      - "0.0.0.0:${YUXI_MILVUS_PORT:-19530}:19530"
+      - "0.0.0.0:${YUXI_MILVUS_HEALTH_PORT:-9091}:9091"
+  minio:
+    ports: !override
+      - "0.0.0.0:${YUXI_MINIO_API_PORT:-9000}:9000"
+      - "0.0.0.0:${YUXI_MINIO_CONSOLE_PORT:-9001}:9001"
+  graph:
+    ports: !override
+      - "0.0.0.0:${YUXI_NEO4J_HTTP_PORT:-7474}:7474"
+      - "0.0.0.0:${YUXI_NEO4J_BOLT_PORT:-7687}:7687"
+  mineru-api:
+    ports: !override
+      - "0.0.0.0:${YUXI_MINERU_PORT:-30001}:30001"
+  sandbox-runner:
+    ports: !override
+      - "0.0.0.0:${YUXI_SANDBOX_PORT:-8090}:8090"
