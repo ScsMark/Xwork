@@ -166,8 +166,9 @@ async def update_workspace_file(
 async def delete_workspace_file_route(
     path: str = Query(..., description="工作区文件或目录路径"),
     current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    return await delete_workspace_path(path=path, current_user=current_user)
+    return await delete_workspace_path(path=path, current_user=current_user, db=db)
 
 
 @workspace.post("/directory", response_model=dict)
