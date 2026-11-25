@@ -1,19 +1,61 @@
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
+import esbuild from 'esbuild'
 import vue from '@vitejs/plugin-vue'
-import { providers } from '@opencode-ai/models/snapshot'
 import { fileViewerRenderers } from '@file-viewer/vite-plugin'
 
+let jszipEsmPromise
+const jszipBrowserBuild = () => {
+  const pnpmDir = fileURLToPath(new URL('./node_modules/.pnpm', import.meta.url))
+  const docxDir = fs.readdirSync(pnpmDir).find((name) => name.startsWith('@file-viewer+docx@'))
+  if (!docxDir) throw new Error('未找到 @file-viewer/docx，无法提供浏览器 JSZip')
+  return createRequire(path.join(pnpmDir, docxDir, 'node_modules/@file-viewer/docx/package.json')).resolve(
+    'jszip/dist/jszip.min.js'
+  )
+}
+const jszipEsmPlugin = {
+  name: 'yuxi-jszip-esm',
+  enforce: 'pre',
+  resolveId(id) {
+    const normalized = String(id || '').split('?')[0]
+    if (
+      normalized === 'jszip' ||
+      normalized.endsWith('/jszip/lib/index.js') ||
+      normalized.endsWith('/jszip/dist/jszip.js') ||
+      normalized.endsWith('/jszip/dist/jszip.min.js')
+    ) {
+      return '\0yuxi-jszip-esm'
+    }
+  },
+  async load(id) {
+    if (id !== '\0yuxi-jszip-esm') return
+    jszipEsmPromise ??= esbuild
+      .build({
+        entryPoints: [jszipBrowserBuild()],
+        bundle: true,
+        format: 'esm',
+        platform: 'browser',
+        write: false,
+        logLevel: 'silent'
+      })
+      .then((result) => result.outputFiles[0].text)
+    return jszipEsmPromise
+  }
+}
+
+// 只压缩开发模块及其内联 source map，API 代理和 SSE 直接流式交付。
 // 快照只在构建进程读取，浏览器只接收展示字段；模型覆盖随锁定依赖更新。
 const modelMetadataPlugin = {
   name: 'model-display-metadata',
   resolveId(id) {
     if (id === 'virtual:model-display-metadata') return '\0' + id
   },
-  load(id) {
+  async load(id) {
     if (id !== '\0virtual:model-display-metadata') return
+    const { providers } = await import('@opencode-ai/models/snapshot')
     const catalog = Object.fromEntries(
       Object.entries(providers).map(([providerId, provider]) => [
         providerId,
@@ -31,7 +73,8 @@ const modelMetadataPlugin = {
         }
       ])
     )
-    return `export const providers = ${JSON.stringify(catalog)}`
+    // 这是从快照生成的纯数据，逐字段源码映射会重复传输整份目录。
+    return { code: `export const providers = ${JSON.stringify(catalog)}`, map: { mappings: '' } }
   }
 }
 
@@ -84,6 +127,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   return {
     plugins: [
+      jszipEsmPlugin,
       vue(),
       modelMetadataPlugin,
       pdfjsCmapsPlugin,
@@ -93,6 +137,8 @@ export default defineConfig(({ mode }) => {
         formats: ['docx', 'xlsx', 'xls', 'pptx'],
         inject: false,
         copyAssets: true,
+        // 按渲染器命名分包会把 Vite preload helper 放进演示文稿 chunk，入口随之静态加载该 chunk。
+        // 保持默认拆包，预览组件的动态 import 仍把渲染器留在异步图里。
         chunkStrategy: 'none',
         missingRenderer: 'error'
       }),
@@ -111,8 +157,16 @@ export default defineConfig(({ mode }) => {
               id !== 'jszip' &&
               id !== 'pdf-lib'
           )
+          // 按需预构建时仍按 CJS 互操作处理，避免浏览器把默认导入改写成不存在的具名导出。
+          const needsInterop = new Set(config.optimizeDeps.needsInterop || [])
+          needsInterop.add('@xmldom/xmldom')
+          config.optimizeDeps.needsInterop = [...needsInterop]
+          const exclude = new Set(config.optimizeDeps.exclude || [])
+          exclude.add('jszip')
+          exclude.add('@file-viewer/docx')
+          config.optimizeDeps.exclude = [...exclude]
         }
-      }
+      },
     ],
     resolve: {
       alias: {
