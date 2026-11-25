@@ -4,6 +4,7 @@ import { fileURLToPath, URL } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { providers } from '@opencode-ai/models/snapshot'
+import { fileViewerRenderers } from '@file-viewer/vite-plugin'
 
 // 快照只在构建进程读取，浏览器只接收展示字段；模型覆盖随锁定依赖更新。
 const modelMetadataPlugin = {
@@ -82,7 +83,37 @@ export default defineConfig(({ mode }) => {
   // eslint-disable-next-line no-undef
   const env = loadEnv(mode, process.cwd(), '')
   return {
-    plugins: [vue(), modelMetadataPlugin, pdfjsCmapsPlugin],
+    plugins: [
+      vue(),
+      modelMetadataPlugin,
+      pdfjsCmapsPlugin,
+      // 只装配 Word / 表格 / PPTX，并把 Worker、WASM、字体复制到同源产物。
+      // inject 关闭后，入口不会静态引入渲染器，预览组件首次打开时再加载虚拟模块。
+      fileViewerRenderers({
+        formats: ['docx', 'xlsx', 'xls', 'pptx'],
+        inject: false,
+        copyAssets: true,
+        chunkStrategy: 'none',
+        missingRenderer: 'error'
+      }),
+      // 插件会把 docx/jszip 放进 optimizeDeps.include，SSR 测试服务器因此启动客户端预构建。
+      // 这些依赖只在 Office 预览动态导入时才需要，开发态由 Vite 按需优化。
+      {
+        name: 'yuxi-office-deps-on-demand',
+        enforce: 'post',
+        configResolved(config) {
+          const include = config.optimizeDeps?.include
+          if (!Array.isArray(include)) return
+          config.optimizeDeps.include = include.filter(
+            (id) =>
+              !id.startsWith('@file-viewer/') &&
+              !id.startsWith('@xmldom/') &&
+              id !== 'jszip' &&
+              id !== 'pdf-lib'
+          )
+        }
+      }
+    ],
     resolve: {
       alias: {
         '@': fileURLToPath(new URL('./src', import.meta.url))

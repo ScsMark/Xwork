@@ -829,6 +829,8 @@ const loadActivePreview = async ({ baseFileOverride = null } = {}) => {
     ...(activePreviewTab.value || {}),
     ...(baseFileOverride || {}),
     path: filePath,
+    threadId: requestedThreadId || '',
+    workspace: isWorkspaceFile,
     resourceBaseUrl:
       baseFileOverride?.artifact_url ||
       activePreviewTab.value?.artifact_url ||
