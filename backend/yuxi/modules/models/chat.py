@@ -144,6 +144,33 @@ class ChatAnthropicAdapter(ChatAnthropic):
         return payload
 
 
+def flatten_system_block_content(payload: dict) -> None:
+    """把 system 消息的 content 块数组拍平为字符串。
+
+    llama.cpp/minja 的 qwen3.5 内嵌模板在 tools 分支中对块数组 system content
+    渲染失败，误报 "System message must be at the beginning"（实际顺序正常）。
+    当 system content 为全 text 块的数组时，用换行 join 拍平成纯字符串。
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if (
+            isinstance(content, list)
+            and content
+            and all(
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                for block in content
+            )
+        ):
+            message["content"] = "\n".join(block["text"] for block in content)
+
+
 def merge_leading_system_messages(payload: dict) -> None:
     """把散落的 system 消息合并进首条。
 
@@ -246,6 +273,7 @@ class ChatCompletionsAdapter(ChatOpenAI):
                 if all(isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str) for block in content):
                     message["content"] = "\n".join(block["text"] for block in content)
         merge_leading_system_messages(payload)
+        flatten_system_block_content(payload)
         return payload
 
     def _restore_wire_reasoning(self, originals: list, wire_messages: list[dict]) -> None:
