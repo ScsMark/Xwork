@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from yuxi.infrastructure.filesystem import await_io
+from yuxi.infrastructure.observability.logging import logger
 from yuxi.modules.agents.runtime.sandbox import UserSandboxBackend
 from yuxi.modules.agents.runtime.sandbox.container import SandboxRunnerClient
 from yuxi.modules.agents.runtime.sandbox.download import download_sandbox_directory
@@ -26,6 +27,13 @@ CLI_TIMEOUT_SECONDS = 300
 GITHUB_REPO_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\.{1,2}$)[A-Za-z0-9_.-]+$")
 GITHUB_HOST = "github.com"
 INVALID_SOURCE_MESSAGE = "source 仅支持远程 Skill 来源白名单中的 HTTPS 地址"
+CLI_ATTEMPTS = 3
+CLI_RETRY_DELAY_SECONDS = 3.0
+# 源仓库克隆/文件下载的瞬时网络故障；只有命中这些特征才重试，避免掩盖真实错误。
+TRANSIENT_CLI_ERROR_RE = re.compile(
+    r"(GnuTLS|TLS connection|Failed to clone|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|socket hang up|HTTP (?:429|5\d\d))",
+    re.IGNORECASE,
+)
 
 
 def _output_tail(output: object, *, lines: int = 6, limit: int = 600) -> str:
@@ -114,12 +122,22 @@ async def download_remote_skills(
             # 每个 runner 请求最多接受 205 个参数，固定参数占用 8 个位置。
             for batch in batched(requests, 98):
                 skill_args = [argument for _index, name in batch for argument in ("--skill", name)]
-                try:
-                    await sandbox.run(["npx", "-y", "skills", "add", normalized_source, *skill_args, "-g", "-y", "--copy"])
-                except ValueError as exc:
-                    # 某个包未匹配时 CLI 会失败，其他已经获取的目录仍可使用。
-                    cli_failed = True
-                    cli_error = str(exc)
+                command = ["npx", "-y", "skills", "add", normalized_source, *skill_args, "-g", "-y", "--copy"]
+                # 拉取源仓库时的 TLS 中断、连接重置属瞬时故障，重试可恢复。
+                for attempt in range(CLI_ATTEMPTS):
+                    try:
+                        await sandbox.run(command)
+                        cli_error = ""
+                        break
+                    except ValueError as exc:
+                        # 某个包未匹配时 CLI 会失败，其他已经获取的目录仍可使用。
+                        cli_error = str(exc)
+                        retryable = TRANSIENT_CLI_ERROR_RE.search(cli_error) is not None
+                        if not retryable or attempt == CLI_ATTEMPTS - 1:
+                            break
+                        logger.warning("skills CLI 瞬时失败，第 {} 次重试：{}", attempt + 1, cli_error[:200])
+                        await asyncio.sleep(CLI_RETRY_DELAY_SECONDS * (attempt + 1))
+                cli_failed = bool(cli_error)
 
             downloaded_dirs: dict[str, Path | None] = {}
             for original_index, name in requests:
