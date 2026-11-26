@@ -248,7 +248,7 @@
                     <div class="repo-input-field">
                       <a-input
                         v-model:value="remoteInstallForm.source"
-                        placeholder="来源仓库或合集地址，如 https://modelscope.cn/collections/MiniMax/MiniMax-Office-skills"
+                        placeholder="来源仓库或合集地址，如 https://github.com/MiniMax-AI/skills"
                       >
                         <template #suffix>
                           <a-dropdown
@@ -542,7 +542,7 @@ const RECOMMENDED_SUITES = [
     provider: 'MiniMax-AI',
     description:
       'MiniMax 开源的办公文档 Skills 合集，覆盖 DOCX、PDF、XLSX 与 PPTX 演示文稿的创建与格式化。',
-    source: 'https://modelscope.cn/collections/MiniMax/MiniMax-Office-skills',
+    source: 'https://github.com/MiniMax-AI/skills',
     skills: [
       {
         slug: 'pptx-generator',
@@ -642,7 +642,7 @@ const installFlow = ref(null)
 const activeTab = ref('repo') // 'repo' 或 'search'
 
 const remoteInstallForm = reactive({
-  source: 'https://modelscope.cn/collections/MiniMax/MiniMax-Office-skills',
+  source: 'https://github.com/MiniMax-AI/skills',
   skills: []
 })
 const remoteSkillOptions = ref([])
