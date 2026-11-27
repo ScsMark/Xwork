@@ -15,6 +15,18 @@ from yuxi.modules.agents.models.sessions import Session
 from yuxi.modules.identity.models import User
 from yuxi.shared.datetime import UTC, ensure_shanghai, format_utc_datetime, shanghai_now, utc_now
 
+UNREGISTERED_AGENT_PREFIX = "未登记智能体"
+
+
+def unregistered_agent_name(slug: str | None) -> str:
+    """会话指向的 Agent 行不存在时的展示名。
+
+    智能体被删除后其历史会话仍留在 `sessions.agent_id`（无外键、无重指派）：这类
+    悬空 slug 的会话必须照常计入统计，系列名也不能显示成裸 slug 让人以为是某个
+    真实智能体。
+    """
+    return f"{UNREGISTERED_AGENT_PREFIX}（{slug or 'unknown'}）"
+
 
 class DashboardRepository:
     """集中封装 Dashboard 的跨表统计查询与读模型聚合。"""
