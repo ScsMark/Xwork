@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readdir, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { build } from 'vite'
@@ -30,7 +30,8 @@ test('Office 预览资源由构建产物同源提供，且不进入入口包', a
       build: { outDir, emptyOutDir: true }
     })
     const files = await walk(outDir)
-    const relative = files.map((file) => file.slice(outDir.length + 1))
+    // 统一成 POSIX 分隔符，Windows 上也能用 /^assets\/.../ 匹配产物相对路径。
+    const relative = files.map((file) => file.slice(outDir.length + 1).split(sep).join('/'))
     const textFiles = files.filter((file) => /\.(js|mjs|css|html|json)$/.test(file))
     for (const file of textFiles) {
       const source = await readFile(file, 'utf8')
